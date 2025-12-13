@@ -11,6 +11,28 @@ app.use(express.json({ limit: "2mb" }));
 app.get("/", (req, res) => {
   res.status(200).send("Workout Agent is running ✅");
 });
+// FREE browser test: inserts one row into Supabase
+app.get("/debug/insert-test", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("polar_sessions")
+      .insert([
+        {
+          session_start: new Date().toISOString(),
+          avg_hr: 145,
+          max_hr: 182,
+          cardio_load: 120
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) return res.status(500).json(error);
+    res.json({ ok: true, inserted: data });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
+});
 
 // Supabase
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -75,3 +97,4 @@ app.post("/webhooks/pushpress", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on port ${port}`));
+
