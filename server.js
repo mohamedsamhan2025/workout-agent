@@ -82,7 +82,8 @@ app.post("/debug/insert", async (req, res) => {
 // --------------------
 app.get("/auth/polar", (req, res) => {
   const url =
-    "https://flow.polar.com/oauth2/authorization" +
+    const url =
+  "https://polarremote.com/v2/oauth2/authorization" +
     `?response_type=code` +
     `&client_id=${process.env.POLAR_CLIENT_ID}` +
     `&redirect_uri=${encodeURIComponent(process.env.POLAR_REDIRECT_URI)}`;
@@ -162,3 +163,4 @@ app.post("/webhooks/pushpress", async (req, res) => {
 // --------------------
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on port ${port}`));
+
