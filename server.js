@@ -1,17 +1,15 @@
-// server.js
 import express from "express";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
-import fetch from "node-fetch";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---------------------------
-// Supabase
-// ---------------------------
+/** -------------------------
+ *  Supabase client
+ *  ------------------------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -19,18 +17,22 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
 
-const supabase = createClient(SUPABASE_URL || "", SUPABASE_SERVICE_ROLE_KEY || "");
+const supabase = createClient(
+  SUPABASE_URL || "",
+  SUPABASE_SERVICE_ROLE_KEY || ""
+);
 
-// ---------------------------
-// Health check
-// ---------------------------
+/** -------------------------
+ *  Health check
+ *  ------------------------- */
 app.get("/", (req, res) => {
   res.status(200).send("Workout Agent is running ✅");
 });
 
-// ---------------------------
-// Debug: insert a sample row (GET)
-// ---------------------------
+/** -------------------------
+ *  Debug insert (GET)
+ *  Visit in browser to insert one test row
+ *  ------------------------- */
 app.get("/debug/insert-test", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -46,20 +48,19 @@ app.get("/debug/insert-test", async (req, res) => {
       .select()
       .single();
 
-    if (error) return res.status(500).json(error);
+    if (error) return res.status(500).json({ ok: false, error });
     return res.json({ ok: true, inserted: data });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e?.message ?? "Unknown error" });
   }
 });
 
-// ---------------------------
-// Debug: insert a row (POST body)
-// ---------------------------
+/** -------------------------
+ *  Debug insert (POST)
+ *  ------------------------- */
 app.post("/debug/insert", async (req, res) => {
   try {
     const payload = req.body ?? {};
-
     const { data, error } = await supabase
       .from("polar_sessions")
       .insert([
@@ -83,10 +84,11 @@ app.post("/debug/insert", async (req, res) => {
   }
 });
 
-// ---------------------------
-// Placeholder "mailbox" endpoints
-// (Polar doesn't truly push webhooks by default — this is just a receiver)
-// ---------------------------
+/** -------------------------
+ *  “Mailbox” endpoints (URLs that can receive POSTs)
+ *  Note: Polar AccessLink is NOT really “webhooks” in the UI like Stripe.
+ *  Polar uses OAuth + API calls, and some subscription callbacks depending on AccessLink.
+ *  ------------------------- */
 app.post("/webhooks/polar", async (req, res) => {
   try {
     const raw = req.body ?? {};
@@ -118,58 +120,59 @@ app.post("/webhooks/pushpress", async (req, res) => {
   }
 });
 
-// ---------------------------
-// Polar OAuth: "Door" -> redirect user to Polar login
-// ---------------------------
+/** -------------------------
+ *  POLAR OAUTH (the “door”)
+ *  ------------------------- */
 app.get("/auth/polar", (req, res) => {
-  const clientId = process.env.POLAR_CLIENT_ID;
-  const redirectUri = process.env.POLAR_REDIRECT_URI;
+  const POLAR_CLIENT_ID = process.env.POLAR_CLIENT_ID;
+  const POLAR_REDIRECT_URI = process.env.POLAR_REDIRECT_URI;
 
-  if (!clientId || !redirectUri) {
-    return res.status(500).send("❌ Missing POLAR_CLIENT_ID or POLAR_REDIRECT_URI in environment variables");
+  if (!POLAR_CLIENT_ID || !POLAR_REDIRECT_URI) {
+    return res.status(500).send("Missing POLAR_CLIENT_ID or POLAR_REDIRECT_URI env vars");
   }
 
-  // ✅ Correct Polar OAuth authorize endpoint
+  // Important: redirect_uri MUST match EXACTLY what you entered in Polar admin
+  const state = "workout_agent_" + Date.now(); // simple state (ok for basic testing)
+
   const url =
-    "https://polarremote.com/v2/oauth2/authorization" +
+    "https://flow.polar.com/oauth2/authorization" +
     `?response_type=code` +
-    `&client_id=${encodeURIComponent(clientId)}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}`;
+    `&client_id=${encodeURIComponent(POLAR_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(POLAR_REDIRECT_URI)}` +
+    `&state=${encodeURIComponent(state)}`;
 
   return res.redirect(url);
 });
 
-// ---------------------------
-// Polar OAuth callback: exchange code for token + store in Supabase
-// ---------------------------
 app.get("/auth/polar/callback", async (req, res) => {
   try {
     const code = req.query.code;
 
     if (!code) {
-      return res.status(400).send("❌ Missing authorization code");
+      return res.status(400).send("Missing authorization code");
     }
 
-    const clientId = process.env.POLAR_CLIENT_ID;
-    const clientSecret = process.env.POLAR_CLIENT_SECRET;
-    const redirectUri = process.env.POLAR_REDIRECT_URI;
+    const POLAR_CLIENT_ID = process.env.POLAR_CLIENT_ID;
+    const POLAR_CLIENT_SECRET = process.env.POLAR_CLIENT_SECRET;
+    const POLAR_REDIRECT_URI = process.env.POLAR_REDIRECT_URI;
 
-    if (!clientId || !clientSecret || !redirectUri) {
-      return res.status(500).send("❌ Missing POLAR_CLIENT_ID / POLAR_CLIENT_SECRET / POLAR_REDIRECT_URI env vars");
+    if (!POLAR_CLIENT_ID || !POLAR_CLIENT_SECRET || !POLAR_REDIRECT_URI) {
+      return res.status(500).send("Missing Polar env vars (ID/SECRET/REDIRECT_URI)");
     }
 
-    // Exchange code for access token
+    // Exchange code for token (Node 22 has global fetch)
     const tokenRes = await fetch("https://polarremote.com/v2/oauth2/token", {
       method: "POST",
       headers: {
         Authorization:
-          "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
+          "Basic " +
+          Buffer.from(`${POLAR_CLIENT_ID}:${POLAR_CLIENT_SECRET}`).toString("base64"),
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code: String(code),
-        redirect_uri: redirectUri,
+        redirect_uri: POLAR_REDIRECT_URI,
       }),
     });
 
@@ -178,25 +181,25 @@ app.get("/auth/polar/callback", async (req, res) => {
     if (!tokenRes.ok) {
       return res.status(400).json({
         ok: false,
-        message: "Token exchange failed",
+        message: "Polar token exchange failed",
         tokenData,
       });
     }
 
-    // Store token securely
-    // Recommended columns: access_token, refresh_token, expires_in, token_type, created_at
+    // Store token in Supabase (you need a polar_tokens table)
     const { error } = await supabase.from("polar_tokens").insert([
       {
-        access_token: tokenData.access_token ?? null,
-        refresh_token: tokenData.refresh_token ?? null,
-        expires_in: tokenData.expires_in ?? null,
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token,
+        expires_in: tokenData.expires_in,
         token_type: tokenData.token_type ?? null,
+        scope: tokenData.scope ?? null,
+        created_at: new Date().toISOString(),
+        raw: tokenData,
       },
     ]);
 
-    if (error) {
-      return res.status(500).json({ ok: false, message: "Failed to save token", error });
-    }
+    if (error) return res.status(500).json({ ok: false, supabase_error: error });
 
     return res.send("✅ Polar connected successfully. You can close this page.");
   } catch (e) {
@@ -204,8 +207,8 @@ app.get("/auth/polar/callback", async (req, res) => {
   }
 });
 
-// ---------------------------
-// Start server
-// ---------------------------
+/** -------------------------
+ *  Start server
+ *  ------------------------- */
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on port ${port}`));
