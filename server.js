@@ -365,6 +365,25 @@ app.post("/webhooks/pushpress", async (req, res) => {
   if (error) return res.status(500).json({ ok: false, error });
   return res.json({ ok: true });
 });
+app.get("/polar/register-status", async (req, res) => {
+  try {
+    const tokenRow = await getLatestPolarToken();
+    const accessToken = tokenRow.access_token;
+
+    const r = await fetch("https://www.polaraccesslink.com/v3/users", {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+    });
+
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw_text: text }; }
+
+    return res.json({ ok: r.ok, status: r.status, data });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on port ${port}`));
+
