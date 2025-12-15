@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
-import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -9,33 +9,30 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // --------------------
-// ENV (Supabase)
+// Env
 // --------------------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const {
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  POLAR_CLIENT_ID,
+  POLAR_CLIENT_SECRET,
+  POLAR_REDIRECT_URI,
+} = process.env;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-}
-
-const supabase = createClient(SUPABASE_URL || "", SUPABASE_SERVICE_ROLE_KEY || "");
-
-// --------------------
-// ENV (Polar)
-// --------------------
-const POLAR_CLIENT_ID = process.env.POLAR_CLIENT_ID;
-const POLAR_CLIENT_SECRET = process.env.POLAR_CLIENT_SECRET;
-const POLAR_REDIRECT_URI = process.env.POLAR_REDIRECT_URI;
-
-function mustHaveEnv() {
+function assertEnv() {
   const missing = [];
+  if (!SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
   if (!POLAR_CLIENT_ID) missing.push("POLAR_CLIENT_ID");
   if (!POLAR_CLIENT_SECRET) missing.push("POLAR_CLIENT_SECRET");
   if (!POLAR_REDIRECT_URI) missing.push("POLAR_REDIRECT_URI");
-  if (!SUPABASE_URL) missing.push("SUPABASE_URL");
-  if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
   if (missing.length) throw new Error(`Missing env vars: ${missing.join(", ")}`);
 }
+
+// --------------------
+// Supabase
+// --------------------
+const supabase = createClient(SUPABASE_URL || "", SUPABASE_SERVICE_ROLE_KEY || "");
 
 // --------------------
 // Helpers
@@ -51,125 +48,96 @@ function randomState() {
 async function getLatestPolarToken() {
   const { data, error } = await supabase
     .from("polar_tokens")
-    .select("access_token, refresh_token, expires_in, token_type, x_user_id, scope, raw, created_at")
+    .select("*")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (error) throw error;
-  return data; // can be null
+  return data; // may be null
 }
 
-function authHeaderFromToken(tokenRow) {
-  const tokenType = (tokenRow?.token_type || "bearer").toLowerCase();
-  if (!tokenRow?.access_token) return null;
-  if (tokenType === "bearer") return `Bearer ${tokenRow.access_token}`;
-  return `${tokenRow.token_type} ${tokenRow.access_token}`;
+async function registerUserWithPolar(accessToken, xUserId) {
+  // You can choose ANY member-id format you want (it’s your ID for the user).
+  const memberId = `mo-${xUserId}`;
+
+  const regRes = await fetch("https://www.polaraccesslink.com/v3/users", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ "member-id": memberId }),
+  });
+
+  // 200 = registered, 409 = already registered
+  if (regRes.status === 200 || regRes.status === 409) {
+    return { ok: true, status: regRes.status };
+  }
+
+  const data = await regRes.json().catch(() => null);
+  return { ok: false, status: regRes.status, data };
 }
 
 // --------------------
 // Health
 // --------------------
-app.get("/", (req, res) => {
-  res.status(200).send("Workout Agent is running ✅");
-});
+app.get("/", (req, res) => res.status(200).send("Workout Agent is running ✅"));
 
 // --------------------
-// Debug: insert one row into polar_sessions (GET)
+// Debug insert (GET)
 // --------------------
 app.get("/debug/insert-test", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("polar_sessions")
-      .insert([
-        {
-          session_start: new Date().toISOString(),
-          avg_hr: 145,
-          max_hr: 182,
-          cardio_load: 120,
-        },
-      ])
-      .select()
-      .single();
-
-    if (error) return res.status(500).json({ ok: false, error });
-    res.json({ ok: true, data });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-// --------------------
-// Debug: insert into polar_sessions (POST)
-// --------------------
-app.post("/debug/insert", async (req, res) => {
-  try {
-    const payload = req.body ?? {};
-    const { data, error } = await supabase
-      .from("polar_sessions")
-      .insert([
-        {
-          session_start: new Date().toISOString(),
-          duration_sec: payload.duration_sec ?? null,
-          avg_hr: payload.avg_hr ?? 140,
-          max_hr: payload.max_hr ?? 175,
-          calories: payload.calories ?? null,
-          cardio_load: payload.cardio_load ?? 100,
-          raw: payload ?? null,
-        },
-      ])
+      .insert([{ session_start: new Date().toISOString(), avg_hr: 145, max_hr: 182, cardio_load: 120 }])
       .select()
       .single();
 
     if (error) return res.status(500).json({ ok: false, error });
     return res.json({ ok: true, data });
   } catch (e) {
-    return res.status(500).json({ ok: false, message: e?.message ?? "Unknown error" });
+    return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
 // --------------------
-// STEP 1: Door to Polar login
+// STEP 1: Polar auth "door" (GET)
 // --------------------
 app.get("/auth/polar", (req, res) => {
   try {
-    mustHaveEnv();
+    assertEnv();
 
-    // IMPORTANT: redirect_uri must match EXACTLY what you entered in Polar admin.
-    const state = randomState();
-
-    const authUrl =
+    const url =
       "https://flow.polar.com/oauth2/authorization" +
       `?response_type=code` +
       `&client_id=${encodeURIComponent(POLAR_CLIENT_ID)}` +
       `&redirect_uri=${encodeURIComponent(POLAR_REDIRECT_URI)}` +
       `&scope=${encodeURIComponent("accesslink.read_all")}` +
-      `&state=${encodeURIComponent(state)}`;
+      `&state=${encodeURIComponent(randomState())}`;
 
-    return res.redirect(authUrl);
+    return res.redirect(url);
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
 // --------------------
-// STEP 2: Callback (exchange code -> token, save token, register user)
+// STEP 2: Polar callback (GET) -> exchange code -> save token -> register user
 // --------------------
 app.get("/auth/polar/callback", async (req, res) => {
   try {
-    mustHaveEnv();
+    assertEnv();
 
     const code = req.query.code;
     const err = req.query.error;
 
-    if (err) {
-      return res.status(400).json({ ok: false, message: "Polar returned an error", error: err });
-    }
-    if (!code) {
-      return res.status(400).send("Missing authorization code");
-    }
+    if (err) return res.status(400).json({ ok: false, message: "Polar error", error: err });
+    if (!code) return res.status(400).send("Missing authorization code");
 
-    // Exchange code for token
+    // Exchange code -> token
     const tokenRes = await fetch("https://polarremote.com/v2/oauth2/token", {
       method: "POST",
       headers: {
@@ -195,49 +163,31 @@ app.get("/auth/polar/callback", async (req, res) => {
       });
     }
 
-    // Save token (must match your polar_tokens columns)
-    const insertToken = {
+    const xUserId = tokenData?.x_user_id;
+    const accessToken = tokenData?.access_token;
+
+    // Save token to Supabase (matches your columns)
+    const row = {
       access_token: tokenData?.access_token ?? null,
       refresh_token: tokenData?.refresh_token ?? null,
       expires_in: tokenData?.expires_in ?? null,
       token_type: tokenData?.token_type ?? null,
-      x_user_id: tokenData?.x_user_id ?? null,
+      x_user_id: xUserId ?? null,
       scope: tokenData?.scope ?? "accesslink.read_all",
       raw: tokenData,
     };
 
-    const { error: tokenSaveErr } = await supabase.from("polar_tokens").insert([insertToken]);
-
-    if (tokenSaveErr) {
-      return res.status(500).json({
-        ok: false,
-        message: "Saved token failed",
-        error: tokenSaveErr,
-      });
+    const { error: saveErr } = await supabase.from("polar_tokens").insert([row]);
+    if (saveErr) {
+      return res.status(500).json({ ok: false, message: "Saved token failed", error: saveErr });
     }
 
-    // Register user (POST /v3/users) -> 200 OK or 409 Already registered
-    // member-id is YOUR identifier, can be anything unique.
-    const memberId = `render_${tokenData?.x_user_id ?? "unknown"}`;
-
-    const regRes = await fetch("https://www.polaraccesslink.com/v3/users", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({ "member-id": memberId }),
-    });
-
-    if (regRes.status !== 200 && regRes.status !== 409) {
-      const regData = await regRes.text();
-      return res.status(400).json({
-        ok: false,
-        message: "User register failed",
-        status: regRes.status,
-        raw: regData,
-      });
+    // Register user (required before data access)
+    if (accessToken && xUserId) {
+      const reg = await registerUserWithPolar(accessToken, xUserId);
+      if (!reg.ok) {
+        return res.status(400).json({ ok: false, message: "User register failed", ...reg });
+      }
     }
 
     return res.send("✅ Polar connected successfully. You can close this page.");
@@ -247,162 +197,117 @@ app.get("/auth/polar/callback", async (req, res) => {
 });
 
 // --------------------
-// Register status (GET /v3/users/{user-id})
+// Optional: manual register (GET) if you ever need it again
+// --------------------
+app.get("/polar/register", async (req, res) => {
+  try {
+    const token = await getLatestPolarToken();
+    if (!token?.access_token || !token?.x_user_id) {
+      return res.status(400).json({ ok: false, message: "No saved Polar token. Visit /auth/polar first." });
+    }
+
+    const reg = await registerUserWithPolar(token.access_token, token.x_user_id);
+    if (!reg.ok) return res.status(400).json({ ok: false, ...reg });
+
+    return res.json({ ok: true, message: "Registered (or already registered)", status: reg.status });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// --------------------
+// Registration status (GET /v3/users/{user-id})
 // --------------------
 app.get("/polar/register-status", async (req, res) => {
   try {
     const token = await getLatestPolarToken();
     if (!token?.access_token || !token?.x_user_id) {
-      return res.status(400).json({
-        ok: false,
-        message: "No saved Polar token yet. Visit /auth/polar first.",
-      });
+      return res.status(400).json({ ok: false, message: "No saved Polar token yet. Visit /auth/polar first." });
     }
 
     const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}`;
-
-    const r = await fetch(url, {
+    const infoRes = await fetch(url, {
       method: "GET",
+      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
+    });
+
+    const data = await infoRes.json().catch(() => null);
+    if (!infoRes.ok) return res.status(400).json({ ok: false, status: infoRes.status, data });
+
+    return res.json({ ok: true, registered: true, data });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// --------------------
+// ✅ Exercise Transactions (deprecated style)
+// STEP A: Create transaction (MUST be POST)
+// --------------------
+app.post("/polar/transactions/exercises", async (req, res) => {
+  try {
+    const token = await getLatestPolarToken();
+    if (!token?.access_token || !token?.x_user_id) {
+      return res.status(400).json({ ok: false, message: "No saved Polar token. Visit /auth/polar first." });
+    }
+
+    const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}/exercise-transactions`;
+
+    const txRes = await fetch(url, {
+      method: "POST",
       headers: {
         Authorization: `Bearer ${token.access_token}`,
         Accept: "application/json",
       },
     });
 
-    if (r.status === 204) return res.json({ ok: true, registered: false, status: 204 });
-
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-
-    if (!r.ok) {
-      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
+    // 201 = created, 204 = no new data
+    if (txRes.status === 204) {
+      return res.json({ ok: true, status: 204, message: "No new training data available (nothing new since last check)." });
     }
 
-    return res.json({ ok: true, registered: true, data: json });
+    const data = await txRes.json().catch(() => null);
+    if (!txRes.ok) return res.status(400).json({ ok: false, status: txRes.status, data });
+
+    return res.json({ ok: true, status: 201, data }); // includes transaction-id
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
 // --------------------
-// List exercise transactions (GET /v3/users/{id}/exercise-transactions)
+// STEP B: List exercises inside a transaction (GET)
 // --------------------
-app.get("/polar/transactions", async (req, res) => {
+app.get("/polar/transactions/exercises/:transactionId", async (req, res) => {
   try {
     const token = await getLatestPolarToken();
     if (!token?.access_token || !token?.x_user_id) {
-      return res.status(400).json({ ok: false, message: "No token/x_user_id found. Visit /auth/polar first." });
-    }
-
-    const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}/exercise-transactions`;
-
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
-    });
-
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-
-    if (!r.ok) {
-      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
-    }
-
-    return res.json({ ok: true, data: json });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-// --------------------
-// List exercises for a transaction (GET /v3/users/{id}/exercise-transactions/{transactionId})
-// --------------------
-app.get("/polar/transactions/:transactionId", async (req, res) => {
-  try {
-    const token = await getLatestPolarToken();
-    if (!token?.access_token || !token?.x_user_id) {
-      return res.status(400).json({ ok: false, message: "No token/x_user_id found. Visit /auth/polar first." });
+      return res.status(400).json({ ok: false, message: "No saved Polar token. Visit /auth/polar first." });
     }
 
     const { transactionId } = req.params;
-
     const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}/exercise-transactions/${transactionId}`;
 
-    const r = await fetch(url, {
+    const listRes = await fetch(url, {
       method: "GET",
       headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
     });
 
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
+    const data = await listRes.json().catch(() => null);
+    if (!listRes.ok) return res.status(400).json({ ok: false, status: listRes.status, data });
 
-    if (!r.ok) {
-      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
-    }
-
-    return res.json({ ok: true, data: json });
+    return res.json({ ok: true, data }); // contains array of exercise URLs
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
 // --------------------
-// Get a single exercise summary by id (GET /v3/exercises/{exerciseId})
-// --------------------
-app.get("/polar/exercise/:exerciseId", async (req, res) => {
-  try {
-    const token = await getLatestPolarToken();
-    if (!token?.access_token) {
-      return res.status(400).json({ ok: false, message: "No saved Polar token yet. Visit /auth/polar first." });
-    }
-
-    const { exerciseId } = req.params;
-    const url = `https://www.polaraccesslink.com/v3/exercises/${exerciseId}`;
-
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
-    });
-
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-
-    if (!r.ok) {
-      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
-    }
-
-    return res.json({ ok: true, data: json });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-// --------------------
-// Placeholder webhook endpoints (optional later)
+// Placeholder webhooks (later)
 // --------------------
 app.post("/webhooks/polar", async (req, res) => {
   const raw = req.body ?? {};
-  const { error } = await supabase.from("polar_sessions").insert([
-    { session_start: new Date().toISOString(), raw },
-  ]);
-  if (error) return res.status(500).json({ ok: false, error });
-  return res.json({ ok: true });
-});
-
-app.post("/webhooks/pushpress", async (req, res) => {
-  const raw = req.body ?? {};
-  const { error } = await supabase.from("pushpress_attendance").insert([
-    {
-      class_start: new Date().toISOString(),
-      class_name: raw?.class_name ?? null,
-      location: raw?.location ?? null,
-      raw,
-    },
-  ]);
+  const { error } = await supabase.from("polar_sessions").insert([{ session_start: new Date().toISOString(), raw }]);
   if (error) return res.status(500).json({ ok: false, error });
   return res.json({ ok: true });
 });
