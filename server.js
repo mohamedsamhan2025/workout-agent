@@ -1,6 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -8,7 +9,7 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // --------------------
-// Supabase
+// ENV (Supabase)
 // --------------------
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -20,7 +21,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL || "", SUPABASE_SERVICE_ROLE_KEY || "");
 
 // --------------------
-// Polar env
+// ENV (Polar)
 // --------------------
 const POLAR_CLIENT_ID = process.env.POLAR_CLIENT_ID;
 const POLAR_CLIENT_SECRET = process.env.POLAR_CLIENT_SECRET;
@@ -31,9 +32,9 @@ function mustHaveEnv() {
   if (!POLAR_CLIENT_ID) missing.push("POLAR_CLIENT_ID");
   if (!POLAR_CLIENT_SECRET) missing.push("POLAR_CLIENT_SECRET");
   if (!POLAR_REDIRECT_URI) missing.push("POLAR_REDIRECT_URI");
-  if (missing.length) {
-    throw new Error(`Missing env vars: ${missing.join(", ")}`);
-  }
+  if (!SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+  if (missing.length) throw new Error(`Missing env vars: ${missing.join(", ")}`);
 }
 
 // --------------------
@@ -43,16 +44,27 @@ function basicAuthHeader(clientId, clientSecret) {
   return "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 }
 
+function randomState() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
 async function getLatestPolarToken() {
   const { data, error } = await supabase
     .from("polar_tokens")
-    .select("*")
+    .select("access_token, refresh_token, expires_in, token_type, x_user_id, scope, raw, created_at")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (error) throw error;
-  return data; // can be null if not connected yet
+  return data; // can be null
+}
+
+function authHeaderFromToken(tokenRow) {
+  const tokenType = (tokenRow?.token_type || "bearer").toLowerCase();
+  if (!tokenRow?.access_token) return null;
+  if (tokenType === "bearer") return `Bearer ${tokenRow.access_token}`;
+  return `${tokenRow.token_type} ${tokenRow.access_token}`;
 }
 
 // --------------------
@@ -117,20 +129,22 @@ app.post("/debug/insert", async (req, res) => {
 });
 
 // --------------------
-// STEP A: "Door" to Polar login (GET)
+// STEP 1: Door to Polar login
 // --------------------
 app.get("/auth/polar", (req, res) => {
   try {
     mustHaveEnv();
 
-    // Per docs: GET https://flow.polar.com/oauth2/authorization?... :contentReference[oaicite:4]{index=4}
+    // IMPORTANT: redirect_uri must match EXACTLY what you entered in Polar admin.
+    const state = randomState();
+
     const authUrl =
       "https://flow.polar.com/oauth2/authorization" +
       `?response_type=code` +
       `&client_id=${encodeURIComponent(POLAR_CLIENT_ID)}` +
       `&redirect_uri=${encodeURIComponent(POLAR_REDIRECT_URI)}` +
       `&scope=${encodeURIComponent("accesslink.read_all")}` +
-      `&state=${encodeURIComponent(cryptoRandomState())}`;
+      `&state=${encodeURIComponent(state)}`;
 
     return res.redirect(authUrl);
   } catch (e) {
@@ -138,14 +152,8 @@ app.get("/auth/polar", (req, res) => {
   }
 });
 
-function cryptoRandomState() {
-  // simple random string, good enough for now
-  return Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
-}
-
 // --------------------
-// STEP B: Polar redirects here with ?code=...
-// Exchange code -> token, save it, then REGISTER user.
+// STEP 2: Callback (exchange code -> token, save token, register user)
 // --------------------
 app.get("/auth/polar/callback", async (req, res) => {
   try {
@@ -161,7 +169,7 @@ app.get("/auth/polar/callback", async (req, res) => {
       return res.status(400).send("Missing authorization code");
     }
 
-    // Token endpoint: POST https://polarremote.com/v2/oauth2/token :contentReference[oaicite:5]{index=5}
+    // Exchange code for token
     const tokenRes = await fetch("https://polarremote.com/v2/oauth2/token", {
       method: "POST",
       headers: {
@@ -172,7 +180,7 @@ app.get("/auth/polar/callback", async (req, res) => {
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code: String(code),
-        redirect_uri: POLAR_REDIRECT_URI, // must match if you used it in /authorization :contentReference[oaicite:6]{index=6}
+        redirect_uri: POLAR_REDIRECT_URI,
       }),
     });
 
@@ -187,14 +195,14 @@ app.get("/auth/polar/callback", async (req, res) => {
       });
     }
 
-    // tokenData contains: access_token, token_type, expires_in, x_user_id :contentReference[oaicite:7]{index=7}
+    // Save token (must match your polar_tokens columns)
     const insertToken = {
       access_token: tokenData?.access_token ?? null,
-      refresh_token: tokenData?.refresh_token ?? null, // may be missing in some flows
+      refresh_token: tokenData?.refresh_token ?? null,
       expires_in: tokenData?.expires_in ?? null,
       token_type: tokenData?.token_type ?? null,
       x_user_id: tokenData?.x_user_id ?? null,
-      scope: "accesslink.read_all",
+      scope: tokenData?.scope ?? "accesslink.read_all",
       raw: tokenData,
     };
 
@@ -208,9 +216,9 @@ app.get("/auth/polar/callback", async (req, res) => {
       });
     }
 
-    // REGISTER user (required before getting data) :contentReference[oaicite:8]{index=8}
-    // POST https://www.polaraccesslink.com/v3/users with Bearer access token :contentReference[oaicite:9]{index=9}
-    const memberId = `user_${tokenData?.x_user_id ?? "unknown"}`; // your own identifier
+    // Register user (POST /v3/users) -> 200 OK or 409 Already registered
+    // member-id is YOUR identifier, can be anything unique.
+    const memberId = `render_${tokenData?.x_user_id ?? "unknown"}`;
 
     const regRes = await fetch("https://www.polaraccesslink.com/v3/users", {
       method: "POST",
@@ -222,14 +230,13 @@ app.get("/auth/polar/callback", async (req, res) => {
       body: JSON.stringify({ "member-id": memberId }),
     });
 
-    // 200 = registered; 409 = already registered :contentReference[oaicite:10]{index=10}
     if (regRes.status !== 200 && regRes.status !== 409) {
-      const regData = await regRes.json().catch(() => null);
+      const regData = await regRes.text();
       return res.status(400).json({
         ok: false,
         message: "User register failed",
         status: regRes.status,
-        data: regData,
+        raw: regData,
       });
     }
 
@@ -240,19 +247,21 @@ app.get("/auth/polar/callback", async (req, res) => {
 });
 
 // --------------------
-// Check registration status (GET /v3/users/{user-id})
+// Register status (GET /v3/users/{user-id})
 // --------------------
 app.get("/polar/register-status", async (req, res) => {
   try {
     const token = await getLatestPolarToken();
     if (!token?.access_token || !token?.x_user_id) {
-      return res.status(400).json({ ok: false, message: "No saved Polar token yet. Visit /auth/polar first." });
+      return res.status(400).json({
+        ok: false,
+        message: "No saved Polar token yet. Visit /auth/polar first.",
+      });
     }
 
-    // Correct endpoint: GET /v3/users/{user-id} :contentReference[oaicite:11]{index=11}
     const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}`;
 
-    const infoRes = await fetch(url, {
+    const r = await fetch(url, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${token.access_token}`,
@@ -260,54 +269,113 @@ app.get("/polar/register-status", async (req, res) => {
       },
     });
 
-    if (infoRes.status === 204) {
-      return res.json({ ok: true, registered: false, status: 204 });
+    if (r.status === 204) return res.json({ ok: true, registered: false, status: 204 });
+
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    if (!r.ok) {
+      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
     }
 
-    const data = await infoRes.json().catch(() => null);
-    if (!infoRes.ok) {
-      return res.status(400).json({ ok: false, status: infoRes.status, data });
-    }
-
-    return res.json({ ok: true, registered: true, data });
+    return res.json({ ok: true, registered: true, data: json });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
 // --------------------
-// List exercises (last 30 days, after registration) :contentReference[oaicite:12]{index=12}
+// List exercise transactions (GET /v3/users/{id}/exercise-transactions)
 // --------------------
-app.get("/polar/exercises", async (req, res) => {
+app.get("/polar/transactions", async (req, res) => {
+  try {
+    const token = await getLatestPolarToken();
+    if (!token?.access_token || !token?.x_user_id) {
+      return res.status(400).json({ ok: false, message: "No token/x_user_id found. Visit /auth/polar first." });
+    }
+
+    const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}/exercise-transactions`;
+
+    const r = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
+    });
+
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    if (!r.ok) {
+      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
+    }
+
+    return res.json({ ok: true, data: json });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// --------------------
+// List exercises for a transaction (GET /v3/users/{id}/exercise-transactions/{transactionId})
+// --------------------
+app.get("/polar/transactions/:transactionId", async (req, res) => {
+  try {
+    const token = await getLatestPolarToken();
+    if (!token?.access_token || !token?.x_user_id) {
+      return res.status(400).json({ ok: false, message: "No token/x_user_id found. Visit /auth/polar first." });
+    }
+
+    const { transactionId } = req.params;
+
+    const url = `https://www.polaraccesslink.com/v3/users/${token.x_user_id}/exercise-transactions/${transactionId}`;
+
+    const r = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
+    });
+
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    if (!r.ok) {
+      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
+    }
+
+    return res.json({ ok: true, data: json });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// --------------------
+// Get a single exercise summary by id (GET /v3/exercises/{exerciseId})
+// --------------------
+app.get("/polar/exercise/:exerciseId", async (req, res) => {
   try {
     const token = await getLatestPolarToken();
     if (!token?.access_token) {
       return res.status(400).json({ ok: false, message: "No saved Polar token yet. Visit /auth/polar first." });
     }
 
-    const params = new URLSearchParams();
-    if (req.query.samples === "true") params.set("samples", "true");
-    if (req.query.zones === "true") params.set("zones", "true");
-    if (req.query.route === "true") params.set("route", "true");
+    const { exerciseId } = req.params;
+    const url = `https://www.polaraccesslink.com/v3/exercises/${exerciseId}`;
 
-    // GET /v3/exercises :contentReference[oaicite:13]{index=13}
-    const url = `https://www.polaraccesslink.com/v3/exercises${params.toString() ? `?${params}` : ""}`;
-
-    const exRes = await fetch(url, {
+    const r = await fetch(url, {
       method: "GET",
-      headers: {
-        Authorization: `Bearer ${token.access_token}`,
-        Accept: "application/json",
-      },
+      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
     });
 
-    const data = await exRes.json().catch(() => null);
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
 
-    if (!exRes.ok) {
-      return res.status(400).json({ ok: false, status: exRes.status, data });
+    if (!r.ok) {
+      return res.status(r.status).json({ ok: false, status: r.status, data: json, raw: text });
     }
 
-    return res.json({ ok: true, count: Array.isArray(data) ? data.length : 0, data });
+    return res.json({ ok: true, data: json });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
